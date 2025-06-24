@@ -131,6 +131,8 @@ class IPPO(MultiAgent):
                         self.values[uid].broadcast_parameters()
 
         # configuration
+        self._shared_parameters = self.cfg.get("shared_parameters", False)
+
         self._learning_epochs = self._as_dict(self.cfg["learning_epochs"])
         self._mini_batches = self._as_dict(self.cfg["mini_batches"])
         self._rollouts = self.cfg["rollouts"]
@@ -177,36 +179,88 @@ class IPPO(MultiAgent):
         self.optimizers = {}
         self.schedulers = {}
 
-        for uid in self.possible_agents:
-            policy = self.policies[uid]
-            value = self.values[uid]
+        if self._shared_parameters:
+            # [xdl]: if parameters are shared, set optimizers and schedulers to the same for all agents
+            uid0 = self.possible_agents[0]
+            policy = self.policies[uid0]
+            value = self.values[uid0]
             if policy is not None and value is not None:
                 if policy is value:
-                    optimizer = torch.optim.Adam(policy.parameters(), lr=self._learning_rate[uid])
+                    optimizer = torch.optim.Adam(policy.parameters(), lr=self._learning_rate[uid0])
                 else:
                     optimizer = torch.optim.Adam(
-                        itertools.chain(policy.parameters(), value.parameters()), lr=self._learning_rate[uid]
+                        itertools.chain(policy.parameters(), value.parameters()), lr=self._learning_rate[uid0]
                     )
-                self.optimizers[uid] = optimizer
-                if self._learning_rate_scheduler[uid] is not None:
-                    self.schedulers[uid] = self._learning_rate_scheduler[uid](
-                        optimizer, **self._learning_rate_scheduler_kwargs[uid]
+                # [xdl]: set the learning rate schedulers to the same with the first agent
+                if self._learning_rate_scheduler[uid0] is not None:
+                    scheduler = self._learning_rate_scheduler[uid0](
+                        optimizer, **self._learning_rate_scheduler_kwargs[uid0]
                     )
+                else:
+                    scheduler = None
+                for uid in self.possible_agents:
+                    self.optimizers[uid] = optimizer
+                    if self._learning_rate_scheduler[uid] is not None:
+                        if scheduler is None:
+                            self.schedulers[uid] = self._learning_rate_scheduler[uid](
+                                optimizer, **self._learning_rate_scheduler_kwargs[uid]
+                            )
+                        else:
+                            self.schedulers[uid] = scheduler
+                    self.checkpoint_modules[uid]["optimizer"] = optimizer
 
-            self.checkpoint_modules[uid]["optimizer"] = self.optimizers[uid]
+                    # set up preprocessors
+                    if self._state_preprocessor[uid] is not None:
+                        self._state_preprocessor[uid] = self._state_preprocessor[uid](
+                            **self._state_preprocessor_kwargs[uid]
+                        )
+                        self.checkpoint_modules[uid]["state_preprocessor"] = self._state_preprocessor[uid]
+                    else:
+                        self._state_preprocessor[uid] = self._empty_preprocessor
 
-            # set up preprocessors
-            if self._state_preprocessor[uid] is not None:
-                self._state_preprocessor[uid] = self._state_preprocessor[uid](**self._state_preprocessor_kwargs[uid])
-                self.checkpoint_modules[uid]["state_preprocessor"] = self._state_preprocessor[uid]
-            else:
-                self._state_preprocessor[uid] = self._empty_preprocessor
+                    if self._value_preprocessor[uid] is not None:
+                        self._value_preprocessor[uid] = self._value_preprocessor[uid](
+                            **self._value_preprocessor_kwargs[uid]
+                        )
+                        self.checkpoint_modules[uid]["value_preprocessor"] = self._value_preprocessor[uid]
+                    else:
+                        self._value_preprocessor[uid] = self._empty_preprocessor
+        else:
+            # check if all policies are the same
+            for uid in self.possible_agents:
+                policy = self.policies[uid]
+                value = self.values[uid]
+                if policy is not None and value is not None:
+                    if policy is value:
+                        optimizer = torch.optim.Adam(policy.parameters(), lr=self._learning_rate[uid])
+                    else:
+                        optimizer = torch.optim.Adam(
+                            itertools.chain(policy.parameters(), value.parameters()), lr=self._learning_rate[uid]
+                        )
+                    self.optimizers[uid] = optimizer
+                    if self._learning_rate_scheduler[uid] is not None:
+                        self.schedulers[uid] = self._learning_rate_scheduler[uid](
+                            optimizer, **self._learning_rate_scheduler_kwargs[uid]
+                        )
 
-            if self._value_preprocessor[uid] is not None:
-                self._value_preprocessor[uid] = self._value_preprocessor[uid](**self._value_preprocessor_kwargs[uid])
-                self.checkpoint_modules[uid]["value_preprocessor"] = self._value_preprocessor[uid]
-            else:
-                self._value_preprocessor[uid] = self._empty_preprocessor
+                self.checkpoint_modules[uid]["optimizer"] = self.optimizers[uid]
+
+                # set up preprocessors
+                if self._state_preprocessor[uid] is not None:
+                    self._state_preprocessor[uid] = self._state_preprocessor[uid](
+                        **self._state_preprocessor_kwargs[uid]
+                    )
+                    self.checkpoint_modules[uid]["state_preprocessor"] = self._state_preprocessor[uid]
+                else:
+                    self._state_preprocessor[uid] = self._empty_preprocessor
+
+                if self._value_preprocessor[uid] is not None:
+                    self._value_preprocessor[uid] = self._value_preprocessor[uid](
+                        **self._value_preprocessor_kwargs[uid]
+                    )
+                    self.checkpoint_modules[uid]["value_preprocessor"] = self._value_preprocessor[uid]
+                else:
+                    self._value_preprocessor[uid] = self._empty_preprocessor
 
     def init(self, trainer_cfg: Optional[Mapping[str, Any]] = None) -> None:
         """Initialize the agent"""
@@ -417,154 +471,331 @@ class IPPO(MultiAgent):
 
             return returns, advantages
 
-        for uid in self.possible_agents:
-            policy = self.policies[uid]
-            value = self.values[uid]
-            memory = self.memories[uid]
+        if self._shared_parameters:
+            # [xdl]: if parameters are shared, the agents share the same policy, value, optimizer and scheduler.
+            # use the first agent's uid to access
+            uid0 = self.possible_agents[0]
+            policy = self.policies[uid0]
+            value = self.values[uid0]
+            optimizer = self.optimizers[uid0]
+            scheduler = self.schedulers.get(uid0, None)
 
+            # sample all batches from memories
+            all_sampled_batches = {}
             # compute returns and advantages
             with torch.no_grad(), torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
                 value.train(False)
                 last_values, _, _ = value.act(
-                    {"states": self._state_preprocessor[uid](self._current_next_states[uid].float())}, role="value"
+                    {"states": self._state_preprocessor[uid0](self._current_next_states[uid0].float())}, role="value"
                 )
                 value.train(True)
-            last_values = self._value_preprocessor[uid](last_values, inverse=True)
+            last_values = self._value_preprocessor[uid0](last_values, inverse=True)
 
-            values = memory.get_tensor_by_name("values")
-            returns, advantages = compute_gae(
-                rewards=memory.get_tensor_by_name("rewards"),
-                dones=memory.get_tensor_by_name("terminated") | memory.get_tensor_by_name("truncated"),
-                values=values,
-                next_values=last_values,
-                discount_factor=self._discount_factor[uid],
-                lambda_coefficient=self._lambda[uid],
-            )
+            for uid in self.possible_agents:
+                memory = self.memories[uid]
 
-            memory.set_tensor_by_name("values", self._value_preprocessor[uid](values, train=True))
-            memory.set_tensor_by_name("returns", self._value_preprocessor[uid](returns, train=True))
-            memory.set_tensor_by_name("advantages", advantages)
+                values = memory.get_tensor_by_name("values")
+                returns, advantages = compute_gae(
+                    rewards=memory.get_tensor_by_name("rewards"),
+                    dones=memory.get_tensor_by_name("terminated") | memory.get_tensor_by_name("truncated"),
+                    values=values,
+                    next_values=last_values,
+                    discount_factor=self._discount_factor[uid],
+                    lambda_coefficient=self._lambda[uid],
+                )
 
-            # sample mini-batches from memory
-            sampled_batches = memory.sample_all(names=self._tensors_names, mini_batches=self._mini_batches[uid])
+                memory.set_tensor_by_name("values", self._value_preprocessor[uid](values, train=True))
+                memory.set_tensor_by_name("returns", self._value_preprocessor[uid](returns, train=True))
+                memory.set_tensor_by_name("advantages", advantages)
 
-            cumulative_policy_loss = 0
-            cumulative_entropy_loss = 0
-            cumulative_value_loss = 0
+                all_sampled_batches[uid] = list(
+                    memory.sample_all(names=self._tensors_names, mini_batches=self._mini_batches[uid])
+                )
+
+            cumulative_all_policy_loss = 0
+            cumulative_all_value_loss = 0
+            cumulative_all_entropy_loss = 0
 
             # learning epochs
-            for epoch in range(self._learning_epochs[uid]):
+            for epoch in range(self._learning_epochs[uid0]):
                 kl_divergences = []
 
                 # mini-batches loop
-                for (
-                    sampled_states,
-                    sampled_actions,
-                    sampled_log_prob,
-                    sampled_values,
-                    sampled_returns,
-                    sampled_advantages,
-                ) in sampled_batches:
+                for minibatch_idx in range(self._mini_batches[uid0]):
+                    all_policy_loss = 0
+                    all_value_loss = 0
+                    all_entropy_loss = 0
 
-                    with torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
+                    for uid in self.possible_agents:
+                        (
+                            sampled_states,
+                            sampled_actions,
+                            sampled_log_prob,
+                            sampled_values,
+                            sampled_returns,
+                            sampled_advantages,
+                        ) = all_sampled_batches[uid][minibatch_idx]
 
-                        sampled_states = self._state_preprocessor[uid](sampled_states, train=not epoch)
+                        with torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
 
-                        _, next_log_prob, _ = policy.act(
-                            {"states": sampled_states, "taken_actions": sampled_actions}, role="policy"
-                        )
+                            sampled_states = self._state_preprocessor[uid](sampled_states, train=not epoch)
 
-                        # compute approximate KL divergence
-                        with torch.no_grad():
-                            ratio = next_log_prob - sampled_log_prob
-                            kl_divergence = ((torch.exp(ratio) - 1) - ratio).mean()
-                            kl_divergences.append(kl_divergence)
-
-                        # early stopping with KL divergence
-                        if self._kl_threshold[uid] and kl_divergence > self._kl_threshold[uid]:
-                            break
-
-                        # compute entropy loss
-                        if self._entropy_loss_scale[uid]:
-                            entropy_loss = -self._entropy_loss_scale[uid] * policy.get_entropy(role="policy").mean()
-                        else:
-                            entropy_loss = 0
-
-                        # compute policy loss
-                        ratio = torch.exp(next_log_prob - sampled_log_prob)
-                        surrogate = sampled_advantages * ratio
-                        surrogate_clipped = sampled_advantages * torch.clip(
-                            ratio, 1.0 - self._ratio_clip[uid], 1.0 + self._ratio_clip[uid]
-                        )
-
-                        policy_loss = -torch.min(surrogate, surrogate_clipped).mean()
-
-                        # compute value loss
-                        predicted_values, _, _ = value.act({"states": sampled_states}, role="value")
-
-                        if self._clip_predicted_values:
-                            predicted_values = sampled_values + torch.clip(
-                                predicted_values - sampled_values, min=-self._value_clip[uid], max=self._value_clip[uid]
+                            _, next_log_prob, _ = policy.act(
+                                {"states": sampled_states, "taken_actions": sampled_actions}, role="policy"
                             )
-                        value_loss = self._value_loss_scale[uid] * F.mse_loss(sampled_returns, predicted_values)
 
-                    # optimization step
-                    self.optimizers[uid].zero_grad()
-                    self.scaler.scale(policy_loss + entropy_loss + value_loss).backward()
+                            # compute approximate KL divergence
+                            with torch.no_grad():
+                                ratio = next_log_prob - sampled_log_prob
+                                kl_divergence = ((torch.exp(ratio) - 1) - ratio).mean()
+                                kl_divergences.append(kl_divergence)
+
+                            # early stopping with KL divergence
+                            if self._kl_threshold[uid] and kl_divergence > self._kl_threshold[uid]:
+                                break
+
+                            # compute entropy loss
+                            if self._entropy_loss_scale[uid]:
+                                entropy_loss = -self._entropy_loss_scale[uid] * policy.get_entropy(role="policy").mean()
+                            else:
+                                entropy_loss = 0
+
+                            # compute policy loss
+                            ratio = torch.exp(next_log_prob - sampled_log_prob)
+                            surrogate = sampled_advantages * ratio
+                            surrogate_clipped = sampled_advantages * torch.clip(
+                                ratio, 1.0 - self._ratio_clip[uid], 1.0 + self._ratio_clip[uid]
+                            )
+
+                            policy_loss = -torch.min(surrogate, surrogate_clipped).mean()
+
+                            # compute value loss
+                            predicted_values, _, _ = value.act({"states": sampled_states}, role="value")
+
+                            if self._clip_predicted_values:
+                                predicted_values = sampled_values + torch.clip(
+                                    predicted_values - sampled_values,
+                                    min=-self._value_clip[uid],
+                                    max=self._value_clip[uid],
+                                )
+                            value_loss = self._value_loss_scale[uid] * F.mse_loss(sampled_returns, predicted_values)
+
+                        # compute value losses for all agents
+                        all_policy_loss += policy_loss / len(self.possible_agents)
+                        all_value_loss += value_loss / len(self.possible_agents)
+                        if self._entropy_loss_scale[uid]:
+                            all_entropy_loss += entropy_loss / len(self.possible_agents)
+
+                    # optimization step for all agents
+                    optimizer.zero_grad()
+                    self.scaler.scale(all_policy_loss + all_value_loss + all_entropy_loss).backward()
 
                     if config.torch.is_distributed:
                         policy.reduce_parameters()
                         if policy is not value:
                             value.reduce_parameters()
 
-                    if self._grad_norm_clip[uid] > 0:
-                        self.scaler.unscale_(self.optimizers[uid])
+                    if self._grad_norm_clip[uid0] > 0:
+                        self.scaler.unscale_(optimizer)
                         if policy is value:
-                            nn.utils.clip_grad_norm_(policy.parameters(), self._grad_norm_clip[uid])
+                            nn.utils.clip_grad_norm_(policy.parameters(), self._grad_norm_clip[uid0])
                         else:
                             nn.utils.clip_grad_norm_(
-                                itertools.chain(policy.parameters(), value.parameters()), self._grad_norm_clip[uid]
+                                itertools.chain(policy.parameters(), value.parameters()), self._grad_norm_clip[uid0]
                             )
 
-                    self.scaler.step(self.optimizers[uid])
+                    self.scaler.step(optimizer)
                     self.scaler.update()
 
-                    # update cumulative losses
-                    cumulative_policy_loss += policy_loss.item()
-                    cumulative_value_loss += value_loss.item()
-                    if self._entropy_loss_scale[uid]:
-                        cumulative_entropy_loss += entropy_loss.item()
+                    # update cumulative losses for all agents
+                    cumulative_all_policy_loss += all_policy_loss.item()
+                    cumulative_all_value_loss += all_value_loss.item()
+                    if self._entropy_loss_scale[uid0]:
+                        cumulative_all_entropy_loss += all_entropy_loss.item()
 
                 # update learning rate
-                if self._learning_rate_scheduler[uid]:
-                    if isinstance(self.schedulers[uid], KLAdaptiveLR):
+                if scheduler is not None:
+                    if isinstance(scheduler, KLAdaptiveLR):
                         kl = torch.tensor(kl_divergences, device=self.device).mean()
                         # reduce (collect from all workers/processes) KL in distributed runs
                         if config.torch.is_distributed:
                             torch.distributed.all_reduce(kl, op=torch.distributed.ReduceOp.SUM)
                             kl /= config.torch.world_size
-                        self.schedulers[uid].step(kl.item())
+                        scheduler.step(kl.item())
                     else:
-                        self.schedulers[uid].step()
+                        scheduler.step()
 
-            # record data
+            # record data in case of shared parameters
             self.track_data(
-                f"Loss / Policy loss ({uid})",
-                cumulative_policy_loss / (self._learning_epochs[uid] * self._mini_batches[uid]),
+                f"Loss / Policy loss (shared)",
+                cumulative_all_policy_loss / (self._learning_epochs[uid0] * self._mini_batches[uid0]),
             )
             self.track_data(
-                f"Loss / Value loss ({uid})",
-                cumulative_value_loss / (self._learning_epochs[uid] * self._mini_batches[uid]),
+                f"Loss / Value loss (shared)",
+                cumulative_all_value_loss / (self._learning_epochs[uid0] * self._mini_batches[uid0]),
             )
-            if self._entropy_loss_scale:
+            if self._entropy_loss_scale[uid0]:
                 self.track_data(
-                    f"Loss / Entropy loss ({uid})",
-                    cumulative_entropy_loss / (self._learning_epochs[uid] * self._mini_batches[uid]),
+                    f"Loss / Entropy loss (shared)",
+                    cumulative_all_entropy_loss / (self._learning_epochs[uid0] * self._mini_batches[uid0]),
+                )
+            self.track_data(
+                f"Policy / Standard deviation (shared)", policy.distribution(role="policy").stddev.mean().item()
+            )
+            if scheduler is not None:
+                self.track_data(f"Learning / Learning rate (shared)", scheduler.get_last_lr()[0])
+
+        else:
+            for uid in self.possible_agents:
+                policy = self.policies[uid]
+                value = self.values[uid]
+                memory = self.memories[uid]
+
+                # compute returns and advantages
+                with torch.no_grad(), torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
+                    value.train(False)
+                    last_values, _, _ = value.act(
+                        {"states": self._state_preprocessor[uid](self._current_next_states[uid].float())}, role="value"
+                    )
+                    value.train(True)
+                last_values = self._value_preprocessor[uid](last_values, inverse=True)
+
+                values = memory.get_tensor_by_name("values")
+                returns, advantages = compute_gae(
+                    rewards=memory.get_tensor_by_name("rewards"),
+                    dones=memory.get_tensor_by_name("terminated") | memory.get_tensor_by_name("truncated"),
+                    values=values,
+                    next_values=last_values,
+                    discount_factor=self._discount_factor[uid],
+                    lambda_coefficient=self._lambda[uid],
                 )
 
-            self.track_data(
-                f"Policy / Standard deviation ({uid})", policy.distribution(role="policy").stddev.mean().item()
-            )
+                memory.set_tensor_by_name("values", self._value_preprocessor[uid](values, train=True))
+                memory.set_tensor_by_name("returns", self._value_preprocessor[uid](returns, train=True))
+                memory.set_tensor_by_name("advantages", advantages)
 
-            if self._learning_rate_scheduler[uid]:
-                self.track_data(f"Learning / Learning rate ({uid})", self.schedulers[uid].get_last_lr()[0])
+                # sample mini-batches from memory
+                sampled_batches = memory.sample_all(names=self._tensors_names, mini_batches=self._mini_batches[uid])
+
+                cumulative_policy_loss = 0
+                cumulative_entropy_loss = 0
+                cumulative_value_loss = 0
+
+                # learning epochs
+                for epoch in range(self._learning_epochs[uid]):
+                    kl_divergences = []
+
+                    # mini-batches loop
+                    for (
+                        sampled_states,
+                        sampled_actions,
+                        sampled_log_prob,
+                        sampled_values,
+                        sampled_returns,
+                        sampled_advantages,
+                    ) in sampled_batches:
+
+                        with torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
+
+                            sampled_states = self._state_preprocessor[uid](sampled_states, train=not epoch)
+
+                            _, next_log_prob, _ = policy.act(
+                                {"states": sampled_states, "taken_actions": sampled_actions}, role="policy"
+                            )
+
+                            # compute approximate KL divergence
+                            with torch.no_grad():
+                                ratio = next_log_prob - sampled_log_prob
+                                kl_divergence = ((torch.exp(ratio) - 1) - ratio).mean()
+                                kl_divergences.append(kl_divergence)
+
+                            # early stopping with KL divergence
+                            if self._kl_threshold[uid] and kl_divergence > self._kl_threshold[uid]:
+                                break
+
+                            # compute entropy loss
+                            if self._entropy_loss_scale[uid]:
+                                entropy_loss = -self._entropy_loss_scale[uid] * policy.get_entropy(role="policy").mean()
+                            else:
+                                entropy_loss = 0
+
+                            # compute policy loss
+                            ratio = torch.exp(next_log_prob - sampled_log_prob)
+                            surrogate = sampled_advantages * ratio
+                            surrogate_clipped = sampled_advantages * torch.clip(
+                                ratio, 1.0 - self._ratio_clip[uid], 1.0 + self._ratio_clip[uid]
+                            )
+
+                            policy_loss = -torch.min(surrogate, surrogate_clipped).mean()
+
+                            # compute value loss
+                            predicted_values, _, _ = value.act({"states": sampled_states}, role="value")
+
+                            if self._clip_predicted_values:
+                                predicted_values = sampled_values + torch.clip(
+                                    predicted_values - sampled_values,
+                                    min=-self._value_clip[uid],
+                                    max=self._value_clip[uid],
+                                )
+                            value_loss = self._value_loss_scale[uid] * F.mse_loss(sampled_returns, predicted_values)
+
+                        # optimization step
+                        self.optimizers[uid].zero_grad()
+                        self.scaler.scale(policy_loss + entropy_loss + value_loss).backward()
+
+                        if config.torch.is_distributed:
+                            policy.reduce_parameters()
+                            if policy is not value:
+                                value.reduce_parameters()
+
+                        if self._grad_norm_clip[uid] > 0:
+                            self.scaler.unscale_(self.optimizers[uid])
+                            if policy is value:
+                                nn.utils.clip_grad_norm_(policy.parameters(), self._grad_norm_clip[uid])
+                            else:
+                                nn.utils.clip_grad_norm_(
+                                    itertools.chain(policy.parameters(), value.parameters()), self._grad_norm_clip[uid]
+                                )
+
+                        self.scaler.step(self.optimizers[uid])
+                        self.scaler.update()
+
+                        # update cumulative losses
+                        cumulative_policy_loss += policy_loss.item()
+                        cumulative_value_loss += value_loss.item()
+                        if self._entropy_loss_scale[uid]:
+                            cumulative_entropy_loss += entropy_loss.item()
+
+                    # update learning rate
+                    if self._learning_rate_scheduler[uid]:
+                        if isinstance(self.schedulers[uid], KLAdaptiveLR):
+                            kl = torch.tensor(kl_divergences, device=self.device).mean()
+                            # reduce (collect from all workers/processes) KL in distributed runs
+                            if config.torch.is_distributed:
+                                torch.distributed.all_reduce(kl, op=torch.distributed.ReduceOp.SUM)
+                                kl /= config.torch.world_size
+                            self.schedulers[uid].step(kl.item())
+                        else:
+                            self.schedulers[uid].step()
+
+                # record data
+                self.track_data(
+                    f"Loss / Policy loss ({uid})",
+                    cumulative_policy_loss / (self._learning_epochs[uid] * self._mini_batches[uid]),
+                )
+                self.track_data(
+                    f"Loss / Value loss ({uid})",
+                    cumulative_value_loss / (self._learning_epochs[uid] * self._mini_batches[uid]),
+                )
+                if self._entropy_loss_scale:
+                    self.track_data(
+                        f"Loss / Entropy loss ({uid})",
+                        cumulative_entropy_loss / (self._learning_epochs[uid] * self._mini_batches[uid]),
+                    )
+
+                self.track_data(
+                    f"Policy / Standard deviation ({uid})", policy.distribution(role="policy").stddev.mean().item()
+                )
+
+                if self._learning_rate_scheduler[uid]:
+                    self.track_data(f"Learning / Learning rate ({uid})", self.schedulers[uid].get_last_lr()[0])

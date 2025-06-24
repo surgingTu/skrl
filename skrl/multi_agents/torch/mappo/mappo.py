@@ -516,17 +516,18 @@ class MAPPO(MultiAgent):
 
             # sample all batches from memories
             all_sampled_batches = {}
+            # compute returns and advantages
+            with torch.no_grad(), torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
+                value.train(False)
+                last_values, _, _ = value.act(
+                    {"states": self._shared_state_preprocessor[uid0](self._current_shared_next_states.float())},
+                    role="value",
+                )
+                value.train(True)
+            last_values = self._value_preprocessor[uid](last_values, inverse=True)
+
             for uid in self.possible_agents:
                 memory = self.memories[uid]
-                # compute returns and advantages
-                with torch.no_grad(), torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
-                    value.train(False)
-                    last_values, _, _ = value.act(
-                        {"states": self._shared_state_preprocessor[uid](self._current_shared_next_states.float())},
-                        role="value",
-                    )
-                    value.train(True)
-                last_values = self._value_preprocessor[uid](last_values, inverse=True)
 
                 values = memory.get_tensor_by_name("values")
                 returns, advantages = compute_gae(

@@ -251,6 +251,19 @@ class Runner:
                                     logger.warning(
                                         "Unable to get AMP space via 'env.amp_observation_space'. Using 'env.observation_space' instead"
                                     )
+                            # print model source
+                            source = model_class(
+                                observation_space=observation_space,
+                                action_space=action_spaces[agent_id],
+                                device=device,
+                                **self._process_cfg(models_cfg[role]),
+                                return_source=True,
+                            )
+                            print("==================================================")
+                            print(f"Model (role): {role}")
+                            print("==================================================\n")
+                            print(source)
+                            print("--------------------------------------------------")
                             # instantiate model
                             shared_policy_models[role] = model_class(
                                 observation_space=observation_space,
@@ -258,14 +271,6 @@ class Runner:
                                 device=device,
                                 **self._process_cfg(models_cfg[role]),
                             )
-
-                            # print model source
-                            source = shared_policy_models[role]
-                            print("==================================================")
-                            print(f"Model (role): {role}")
-                            print("==================================================\n")
-                            print(source)
-                            print("--------------------------------------------------")
                     # shared models
                     else:
                         roles = list(models_cfg.keys())
@@ -286,8 +291,8 @@ class Runner:
                             structure.append(model_structure)
                             parameters.append(self._process_cfg(models_cfg[role]))
                         model_class = self._component("Shared")
-                        # instantiate model
-                        shared_instance = model_class(
+                        # print model source
+                        source = model_class(
                             observation_space=observation_spaces[agent_id],
                             action_space=action_spaces[agent_id],
                             device=device,
@@ -296,17 +301,23 @@ class Runner:
                             parameters=parameters,
                             return_source=True,
                         )
-                        # instantiate shared model for each role
-                        for role in roles:
-                            shared_policy_models[role] = shared_instance
-
-                        # print model source
-                        source = shared_instance
                         print("==================================================")
                         print(f"Shared model (roles): {roles}")
                         print("==================================================\n")
                         print(source)
                         print("--------------------------------------------------")
+                        # instantiate model
+                        shared_instance = model_class(
+                            observation_space=observation_spaces[agent_id],
+                            action_space=action_spaces[agent_id],
+                            device=device,
+                            structure=structure,
+                            roles=roles,
+                            parameters=parameters,
+                        )
+                        # instantiate shared model for each role
+                        for role in roles:
+                            shared_policy_models[role] = shared_instance
                 else:
                     pass
 
