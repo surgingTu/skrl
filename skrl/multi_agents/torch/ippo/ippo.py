@@ -180,7 +180,7 @@ class IPPO(MultiAgent):
         self.schedulers = {}
 
         if self._shared_parameters:
-            # [xdl]: if parameters are shared, set optimizers and schedulers to the same for all agents
+            # if parameters are shared, set optimizers and schedulers to the same for all agents
             uid0 = self.possible_agents[0]
             policy = self.policies[uid0]
             value = self.values[uid0]
@@ -191,7 +191,7 @@ class IPPO(MultiAgent):
                     optimizer = torch.optim.Adam(
                         itertools.chain(policy.parameters(), value.parameters()), lr=self._learning_rate[uid0]
                     )
-                # [xdl]: set the learning rate schedulers to the same with the first agent
+                # set the learning rate schedulers to the same with the first agent
                 if self._learning_rate_scheduler[uid0] is not None:
                     scheduler = self._learning_rate_scheduler[uid0](
                         optimizer, **self._learning_rate_scheduler_kwargs[uid0]
@@ -472,7 +472,7 @@ class IPPO(MultiAgent):
             return returns, advantages
 
         if self._shared_parameters:
-            # [xdl]: if parameters are shared, the agents share the same policy, value, optimizer and scheduler.
+            # if parameters are shared, the agents share the same policy, value, optimizer and scheduler.
             # use the first agent's uid to access
             uid0 = self.possible_agents[0]
             policy = self.policies[uid0]
