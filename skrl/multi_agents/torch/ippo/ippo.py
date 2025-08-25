@@ -9,6 +9,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import os
+from torch.utils.tensorboard import SummaryWriter
+from torchviz import make_dot
+
 from skrl import config, logger
 from skrl.memories.torch import Memory
 from skrl.models.torch import Model
@@ -63,6 +67,15 @@ IPPO_DEFAULT_CONFIG = {
 
         "wandb": False,             # whether to use Weights & Biases
         "wandb_kwargs": {}          # wandb kwargs (see https://docs.wandb.ai/ref/python/init)
+    },
+
+    "debug": {
+        "export_autograd_graph": False,      # True 时导出一次 autograd 计算图 (loss 的反向图)
+        "export_dir": "/home/surgingtu/Desktop/autograd_graphs",     # 计算图导出目录
+        "tensorboard": False,                # True 时将梯度直方图/标量写入 TensorBoard
+        "tb_logdir": "runs/ippo",
+        "print_param_grad_norms": False,     # 反向传播后打印各层梯度范数
+        "retain_pred_values_grad": False     # True 时抓取 predicted_values 的中间梯度做展示
     }
 }
 # [end-config-dict-torch]
@@ -261,6 +274,43 @@ class IPPO(MultiAgent):
                     self.checkpoint_modules[uid]["value_preprocessor"] = self._value_preprocessor[uid]
                 else:
                     self._value_preprocessor[uid] = self._empty_preprocessor
+
+        self._debug = self.cfg.get("debug", {})
+        self._writer = None
+        self._global_update_step = 0
+        if self._debug.get("tensorboard", False):
+            logdir = self._debug.get("tb_logdir", "runs/ippo")
+            os.makedirs(logdir, exist_ok=True)
+            self._writer = SummaryWriter(logdir)
+        # 计算图文件夹
+        self._export_dir = self._debug.get("export_dir", "autograd_graphs")
+        if self._debug.get("export_autograd_graph", False):
+            os.makedirs(self._export_dir, exist_ok=True)
+
+    def _params_for_viz(self, policy: nn.Module, value: nn.Module):
+        """合并 policy/value 的命名参数字典（前缀区分），供 torchviz 标注节点用。"""
+        params = {}
+        if policy is not None:
+            for n, p in policy.named_parameters():
+                params[f"policy.{n}"] = p
+        if value is not None:
+            for n, p in value.named_parameters():
+                # 如果 policy/value 共享权重，名字可能重复，此处不用覆盖
+                params.setdefault(f"value.{n}", p)
+        return params
+
+    def _export_autograd_graph_once(self, loss: torch.Tensor, policy: nn.Module, value: nn.Module,
+                                    tag: str = "shared_ep0_mb0"):
+        """基于 loss 构造 autograd 反向图并导出 (PNG)。建议只在首个 epoch/mini-batch 导出一次。"""
+        if not self._debug.get("export_autograd_graph", False):
+            return
+        try:
+            dot = make_dot(loss, params=self._params_for_viz(policy, value))
+            dot.format = "png"
+            path = os.path.join(self._export_dir, f"autograd_{tag}")
+            dot.render(path, cleanup=True)   # 生成 autograd_{tag}.png
+        except Exception as e:
+            logger.warning(f"[autograd export] failed: {e}")
 
     def init(self, trainer_cfg: Optional[Mapping[str, Any]] = None) -> None:
         """Initialize the agent"""
@@ -526,6 +576,11 @@ class IPPO(MultiAgent):
                     all_value_loss = 0
                     all_entropy_loss = 0
 
+                    entropy_loss = {}
+                    policy_loss = {}
+                    value_loss = {}
+                    predicted_values = {}
+
                     for uid in self.possible_agents:
                         (
                             sampled_states,
@@ -556,9 +611,9 @@ class IPPO(MultiAgent):
 
                             # compute entropy loss
                             if self._entropy_loss_scale[uid]:
-                                entropy_loss = -self._entropy_loss_scale[uid] * policy.get_entropy(role="policy").mean()
+                                entropy_loss[uid] = -self._entropy_loss_scale[uid] * policy.get_entropy(role="policy").mean()
                             else:
-                                entropy_loss = 0
+                                entropy_loss[uid] = 0
 
                             # compute policy loss
                             ratio = torch.exp(next_log_prob - sampled_log_prob)
@@ -567,28 +622,95 @@ class IPPO(MultiAgent):
                                 ratio, 1.0 - self._ratio_clip[uid], 1.0 + self._ratio_clip[uid]
                             )
 
-                            policy_loss = -torch.min(surrogate, surrogate_clipped).mean()
+                            policy_loss[uid] = -torch.min(surrogate, surrogate_clipped).mean()
 
                             # compute value loss
-                            predicted_values, _, _ = value.act({"states": sampled_states}, role="value")
+                            predicted_values[uid], _, _ = value.act({"states": sampled_states}, role="value")
 
                             if self._clip_predicted_values:
-                                predicted_values = sampled_values + torch.clip(
-                                    predicted_values - sampled_values,
+                                predicted_values[uid] = sampled_values + torch.clip(
+                                    predicted_values[uid] - sampled_values,
                                     min=-self._value_clip[uid],
                                     max=self._value_clip[uid],
                                 )
-                            value_loss = self._value_loss_scale[uid] * F.mse_loss(sampled_returns, predicted_values)
+                            value_loss[uid] = self._value_loss_scale[uid] * F.mse_loss(predicted_values[uid], sampled_returns)
 
                         # compute value losses for all agents
-                        all_policy_loss += policy_loss / len(self.possible_agents)
-                        all_value_loss += value_loss / len(self.possible_agents)
+                        all_policy_loss += policy_loss[uid] / len(self.possible_agents)
+                        all_value_loss += value_loss[uid] / len(self.possible_agents)
                         if self._entropy_loss_scale[uid]:
-                            all_entropy_loss += entropy_loss / len(self.possible_agents)
+                            all_entropy_loss += entropy_loss[uid] / len(self.possible_agents)
+
+
+                    # if epoch == 0 and minibatch_idx == 0:
+                    # # 总图（你已经有了）
+                    #     self._export_autograd_graph_once(
+                    #         loss=total_loss, policy=policy, value=value, tag=f"shared_total_ep{epoch}_mb{minibatch_idx}"
+                    #     )
+                    #     # 子图：仅 policy
+                    #     if all_policy_loss.requires_grad:
+                    #         self._export_autograd_graph_once(
+                    #             loss=all_policy_loss, policy=policy, value=None, tag=f"shared_policy_ep{epoch}_mb{minibatch_idx}"
+                    #         )
+                    #     # 子图：仅 value
+                    #     if all_value_loss.requires_grad:
+                    #         self._export_autograd_graph_once(
+                    #             loss=all_value_loss, policy=None, value=value, tag=f"shared_value_ep{epoch}_mb{minibatch_idx}"
+                    #         )
+                    #     # 子图：仅 entropy（如果有）
+                    #     if (all_entropy_loss is not None) and (not isinstance(all_entropy_loss, (int, float))):
+                    #         if all_entropy_loss.requires_grad:
+                    #             self._export_autograd_graph_once(
+                    #                 loss=all_entropy_loss, policy=policy, value=None, tag=f"shared_entropy_ep{epoch}_mb{minibatch_idx}"
+                    #             )
+
+                    # # === 选择性抓中间张量梯度（predicted_values）===
+                    # if self._debug.get("retain_pred_values_grad", False):
+                    #     # 以第一个 agent 为例
+                    #     first_uid = self.possible_agents[0]
+                    #     if isinstance(predicted_values.get(first_uid, None), torch.Tensor):
+                    #         predicted_values[first_uid].retain_grad()
 
                     # optimization step for all agents
                     optimizer.zero_grad()
                     self.scaler.scale(all_policy_loss + all_value_loss + all_entropy_loss).backward()
+
+                    
+                    # # 打印value_loss相对于predicted_values的导数
+                    # print(f"Agent {first_uid} - Gradient of value_loss w.r.t predicted_values (existing gradient after backward):")
+                    # if predicted_values[first_uid].requires_grad and predicted_values[first_uid].grad is not None:
+                    #     grad_value_loss = predicted_values[first_uid].grad
+                    #     print(f"  Full gradient tensor:\n{grad_value_loss}")
+                    # else:
+                    #     print(f"  predicted_values.grad is None or doesn't require gradients")
+
+                    # print(f"Agent {second_uid} - Gradient of value_loss w.r.t predicted_values (existing gradient after backward):")
+                    # if predicted_values[second_uid].requires_grad and predicted_values[second_uid].grad is not None:
+                    #     grad_value_loss = predicted_values[second_uid].grad
+                    #     print(f"  Full gradient tensor:\n{grad_value_loss}")
+                    # else:
+                    #     print(f"  predicted_values.grad is None or doesn't require gradients")
+
+                    # print(f"Agent {third_uid} - Gradient of value_loss w.r.t predicted_values (existing gradient after backward):")
+                    # if predicted_values[third_uid].requires_grad and predicted_values[third_uid].grad is not None:
+                    #     grad_value_loss = predicted_values[third_uid].grad
+                    #     print(f"  Full gradient tensor:\n{grad_value_loss}")
+                    # else:
+                    #     print(f"  predicted_values.grad is None or doesn't require gradients")
+
+                    # print(f"Agent {fourth_uid} - Gradient of value_loss w.r.t predicted_values (existing gradient after backward):")
+                    # if predicted_values[fourth_uid].requires_grad and predicted_values[fourth_uid].grad is not None:
+                    #     grad_value_loss = predicted_values[fourth_uid].grad
+                    #     print(f"  Full gradient tensor:\n{grad_value_loss}")
+                    # else:
+                    #     print(f"  predicted_values.grad is None or doesn't require gradients")
+
+                    # print(f"Agent {fifth_uid} - Gradient of value_loss w.r.t predicted_values (existing gradient after backward):")
+                    # if predicted_values[fifth_uid].requires_grad and predicted_values[fifth_uid].grad is not None:
+                    #     grad_value_loss = predicted_values[fifth_uid].grad
+                    #     print(f"  Full gradient tensor:\n{grad_value_loss}")
+                    # else:
+                    #     print(f"  predicted_values.grad is None or doesn't require gradients")
 
                     if config.torch.is_distributed:
                         policy.reduce_parameters()
@@ -597,6 +719,35 @@ class IPPO(MultiAgent):
 
                     if self._grad_norm_clip[uid0] > 0:
                         self.scaler.unscale_(optimizer)
+
+                        
+                        # # === 新增：打印参数梯度范数、写入 TensorBoard 直方图 ===
+                        # if self._debug.get("print_param_grad_norms", False) or self._debug.get("tensorboard", False):
+                        #     # policy
+                        #     for name, p in policy.named_parameters():
+                        #         if p.grad is not None:
+                        #             if self._debug.get("print_param_grad_norms", False):
+                        #                 print(f"[grad] policy.{name:30s} |norm|={p.grad.norm().item():.4e}")
+                        #             if self._writer is not None:
+                        #                 self._writer.add_histogram(f"grads/policy/{name}", p.grad, self._global_update_step)
+                        #     # value
+                        #     for name, p in value.named_parameters():
+                        #         if p.grad is not None:
+                        #             if self._debug.get("print_param_grad_norms", False):
+                        #                 print(f"[grad] value.{name:31s} |norm|={p.grad.norm().item():.4e}")
+                        #             if self._writer is not None:
+                        #                 self._writer.add_histogram(f"grads/value/{name}", p.grad, self._global_update_step)
+
+                        # # === 可选：查看中间张量 predicted_values 的梯度 ===
+                        # if self._debug.get("retain_pred_values_grad", False):
+                        #     first_uid = self.possible_agents[0]
+                        #     pv = predicted_values.get(first_uid, None)
+                        #     if isinstance(pv, torch.Tensor):
+                        #         g = getattr(pv, "grad", None)
+                        #         print(f"[grad] d(total_loss)/d(predicted_values[{first_uid}]) ->",
+                        #             "None" if g is None else f"mean|g|={g.abs().mean().item():.4e}, shape={tuple(g.shape)}")
+
+
                         if policy is value:
                             nn.utils.clip_grad_norm_(policy.parameters(), self._grad_norm_clip[uid0])
                         else:
@@ -681,6 +832,11 @@ class IPPO(MultiAgent):
                 cumulative_entropy_loss = 0
                 cumulative_value_loss = 0
 
+                predicted_values = {}
+                entropy_loss = {}
+                policy_loss = {}
+                value_loss = {}
+
                 # learning epochs
                 for epoch in range(self._learning_epochs[uid]):
                     kl_divergences = []
@@ -715,9 +871,9 @@ class IPPO(MultiAgent):
 
                             # compute entropy loss
                             if self._entropy_loss_scale[uid]:
-                                entropy_loss = -self._entropy_loss_scale[uid] * policy.get_entropy(role="policy").mean()
+                                entropy_loss[uid] = -self._entropy_loss_scale[uid] * policy.get_entropy(role="policy").mean()
                             else:
-                                entropy_loss = 0
+                                entropy_loss[uid] = 0
 
                             # compute policy loss
                             ratio = torch.exp(next_log_prob - sampled_log_prob)
@@ -726,22 +882,22 @@ class IPPO(MultiAgent):
                                 ratio, 1.0 - self._ratio_clip[uid], 1.0 + self._ratio_clip[uid]
                             )
 
-                            policy_loss = -torch.min(surrogate, surrogate_clipped).mean()
+                            policy_loss[uid] = -torch.min(surrogate, surrogate_clipped).mean()
 
                             # compute value loss
-                            predicted_values, _, _ = value.act({"states": sampled_states}, role="value")
+                            predicted_values[uid], _, _ = value.act({"states": sampled_states}, role="value")
 
                             if self._clip_predicted_values:
-                                predicted_values = sampled_values + torch.clip(
-                                    predicted_values - sampled_values,
+                                predicted_values[uid] = sampled_values + torch.clip(
+                                    predicted_values[uid] - sampled_values,
                                     min=-self._value_clip[uid],
                                     max=self._value_clip[uid],
                                 )
-                            value_loss = self._value_loss_scale[uid] * F.mse_loss(sampled_returns, predicted_values)
+                            value_loss[uid] = self._value_loss_scale[uid] * F.mse_loss(sampled_returns, predicted_values[uid])
 
                         # optimization step
                         self.optimizers[uid].zero_grad()
-                        self.scaler.scale(policy_loss + entropy_loss + value_loss).backward()
+                        self.scaler.scale(policy_loss[uid] + entropy_loss[uid] + value_loss[uid]).backward()
 
                         if config.torch.is_distributed:
                             policy.reduce_parameters()
@@ -761,10 +917,10 @@ class IPPO(MultiAgent):
                         self.scaler.update()
 
                         # update cumulative losses
-                        cumulative_policy_loss += policy_loss.item()
-                        cumulative_value_loss += value_loss.item()
+                        cumulative_policy_loss += policy_loss[uid].item()
+                        cumulative_value_loss += value_loss[uid].item()
                         if self._entropy_loss_scale[uid]:
-                            cumulative_entropy_loss += entropy_loss.item()
+                            cumulative_entropy_loss += entropy_loss[uid].item()
 
                     # update learning rate
                     if self._learning_rate_scheduler[uid]:
