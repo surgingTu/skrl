@@ -18,7 +18,8 @@ from skrl.memories.torch import Memory
 from skrl.models.torch import Model
 from skrl.multi_agents.torch import MultiAgent
 from skrl.resources.schedulers.torch import KLAdaptiveLR
-
+from torch.optim.lr_scheduler import StepLR, ExponentialLR, CosineAnnealingLR, ReduceLROnPlateau, OneCycleLR, CosineAnnealingWarmRestarts
+from skrl.resources.preprocessors.torch import RunningStandardScaler
 
 # fmt: off
 # [start-config-dict-torch]
@@ -31,13 +32,22 @@ IPPO_DEFAULT_CONFIG = {
     "lambda": 0.95,                 # TD(lambda) coefficient (lam) for computing returns and advantages
 
     "learning_rate": 1e-3,                  # learning rate
+    "policy_learning_rate": 1e-3,           # policy learning rate
+    "value_learning_rate": 1e-3,            # value learning rate
     "learning_rate_scheduler": None,        # learning rate scheduler class (see torch.optim.lr_scheduler)
+    "policy_learning_rate_scheduler": None, # policy network learning rate scheduler
+    "value_learning_rate_scheduler": None,  # value network learning rate scheduler
     "learning_rate_scheduler_kwargs": {},   # learning rate scheduler's kwargs (e.g. {"step_size": 1e-3})
+    "policy_learning_rate_scheduler_kwargs": {}, # policy scheduler's kwargs
+    "value_learning_rate_scheduler_kwargs": {},  # value scheduler's kwargs
 
     "state_preprocessor": None,             # state preprocessor class (see skrl.resources.preprocessors)
     "state_preprocessor_kwargs": {},        # state preprocessor's kwargs (e.g. {"size": env.observation_space})
     "value_preprocessor": None,             # value preprocessor class (see skrl.resources.preprocessors)
     "value_preprocessor_kwargs": {},        # value preprocessor's kwargs (e.g. {"size": 1})
+    "all_action_preprocessor": None,       # last action preprocessor class (see skrl.resources.preprocessors)
+    "all_action_preprocessor_kwargs": {},  # last action preprocessor's kwargs (e.g. {"size": 1})
+
 
     "random_timesteps": 0,          # random exploration steps
     "learning_starts": 0,           # learning starts after this many steps
@@ -146,6 +156,7 @@ class IPPO(MultiAgent):
         # configuration
         self._shared_parameters = self.cfg.get("shared_parameters", False)
 
+        self._separate = self.cfg.get("separate", True)
         self._learning_epochs = self._as_dict(self.cfg["learning_epochs"])
         self._mini_batches = self._as_dict(self.cfg["mini_batches"])
         self._rollouts = self.cfg["rollouts"]
@@ -162,13 +173,21 @@ class IPPO(MultiAgent):
         self._kl_threshold = self._as_dict(self.cfg["kl_threshold"])
 
         self._learning_rate = self._as_dict(self.cfg["learning_rate"])
+        self._policy_learning_rate = self._as_dict(self.cfg["policy_learning_rate"])
+        self._value_learning_rate = self._as_dict(self.cfg["value_learning_rate"])
         self._learning_rate_scheduler = self._as_dict(self.cfg["learning_rate_scheduler"])
+        self._policy_learning_rate_scheduler = self._as_dict(self.cfg["policy_learning_rate_scheduler"])
+        self._value_learning_rate_scheduler = self._as_dict(self.cfg["value_learning_rate_scheduler"])
         self._learning_rate_scheduler_kwargs = self._as_dict(self.cfg["learning_rate_scheduler_kwargs"])
+        self._policy_learning_rate_scheduler_kwargs = self._as_dict(self.cfg["policy_learning_rate_scheduler_kwargs"])
+        self._value_learning_rate_scheduler_kwargs = self._as_dict(self.cfg["value_learning_rate_scheduler_kwargs"])
 
         self._state_preprocessor = self._as_dict(self.cfg["state_preprocessor"])
         self._state_preprocessor_kwargs = self._as_dict(self.cfg["state_preprocessor_kwargs"])
         self._value_preprocessor = self._as_dict(self.cfg["value_preprocessor"])
         self._value_preprocessor_kwargs = self._as_dict(self.cfg["value_preprocessor_kwargs"])
+        self._all_action_preprocessor = self._as_dict(self.cfg["all_action_preprocessor"])
+        self._all_action_preprocessor_kwargs = self._as_dict(self.cfg["all_action_preprocessor_kwargs"])
 
         self._discount_factor = self._as_dict(self.cfg["discount_factor"])
         self._lambda = self._as_dict(self.cfg["lambda"])
@@ -190,7 +209,62 @@ class IPPO(MultiAgent):
 
         # set up optimizer and learning rate scheduler
         self.optimizers = {}
+        self.policy_optimizers = {}
+        self.value_optimizers = {}
         self.schedulers = {}
+        self.policy_schedulers = {}
+        self.value_schedulers = {}
+
+        # 创建调度器类映射
+        self._scheduler_class_map = {
+            "KLAdaptiveLR": KLAdaptiveLR,
+            "StepLR": StepLR,
+            "ExponentialLR": ExponentialLR,
+            "CosineAnnealingLR": CosineAnnealingLR,
+            "ReduceLROnPlateau": ReduceLROnPlateau,
+            "OneCycleLR": OneCycleLR,
+            "CosineAnnealingWarmRestarts": CosineAnnealingWarmRestarts,
+        }
+
+        # 创建预处理器类映射
+        self._preprocessor_class_map = {
+            "RunningStandardScaler": RunningStandardScaler,
+        }
+
+        # 手动转换字符串为类对象
+        print(self._separate)
+        if self._separate:
+            for uid in self.possible_agents:
+                # 转换policy调度器
+                if isinstance(self._policy_learning_rate_scheduler[uid], str):
+                    scheduler_name = self._policy_learning_rate_scheduler[uid]
+                    if scheduler_name in self._scheduler_class_map:           
+                        self._policy_learning_rate_scheduler[uid] = self._scheduler_class_map[scheduler_name]
+                    else:
+                        # 尝试从torch.optim.lr_scheduler中获取
+                        try:
+                            self._policy_learning_rate_scheduler[uid] = getattr(torch.optim.lr_scheduler, scheduler_name)
+                        except AttributeError:
+                            raise ValueError(f"Unknown policy scheduler: {scheduler_name}")
+        
+                # 转换value调度器
+                if isinstance(self._value_learning_rate_scheduler[uid], str):
+                    scheduler_name = self._value_learning_rate_scheduler[uid]
+                    if scheduler_name in self._scheduler_class_map:
+                        self._value_learning_rate_scheduler[uid] = self._scheduler_class_map[scheduler_name]
+                    else:
+                        # 尝试从torch.optim.lr_scheduler中获取
+                        try:
+                            self._value_learning_rate_scheduler[uid] = getattr(torch.optim.lr_scheduler, scheduler_name)
+                        except AttributeError:
+                            raise ValueError(f"Unknown value scheduler: {scheduler_name}")
+
+                if isinstance(self._all_action_preprocessor[uid], str):
+                    preprocessor_name = self._all_action_preprocessor[uid]
+                    if preprocessor_name in self._preprocessor_class_map:
+                        self._all_action_preprocessor[uid] = self._preprocessor_class_map[preprocessor_name]
+                    else:
+                        raise ValueError(f"Unknown all action preprocessor: {preprocessor_name}")
 
         if self._shared_parameters:
             # if parameters are shared, set optimizers and schedulers to the same for all agents
@@ -200,28 +274,68 @@ class IPPO(MultiAgent):
             if policy is not None and value is not None:
                 if policy is value:
                     optimizer = torch.optim.Adam(policy.parameters(), lr=self._learning_rate[uid0])
+                    # set the learning rate schedulers to the same with the first agent
+                    if self._learning_rate_scheduler[uid0] is not None:
+                        # print(self._learning_rate_scheduler[uid0])
+                        # print(self._learning_rate_scheduler_kwargs[uid0])
+                        # print(optimizer)
+                        scheduler = self._learning_rate_scheduler[uid0](
+                            optimizer, **self._learning_rate_scheduler_kwargs[uid0]
+                        )
+                    else:
+                        scheduler = None
                 else:
-                    optimizer = torch.optim.Adam(
-                        itertools.chain(policy.parameters(), value.parameters()), lr=self._learning_rate[uid0]
-                    )
-                # set the learning rate schedulers to the same with the first agent
-                if self._learning_rate_scheduler[uid0] is not None:
-                    scheduler = self._learning_rate_scheduler[uid0](
-                        optimizer, **self._learning_rate_scheduler_kwargs[uid0]
-                    )
-                else:
-                    scheduler = None
+                    policy_optimizer = torch.optim.Adam(policy.parameters(), lr=self._policy_learning_rate[uid0])
+                    value_optimizer = torch.optim.Adam(value.parameters(), lr=self._value_learning_rate[uid0])
+                    # set the learning rate schedulers to the same with the first agent
+                    if self._policy_learning_rate_scheduler[uid0] is not None:
+                        # 打印输入值检查为什么报错
+                        print(self._policy_learning_rate_scheduler[uid0])
+                        print(self._policy_learning_rate_scheduler_kwargs[uid0])
+                        print(policy_optimizer)
+                        policy_scheduler = self._policy_learning_rate_scheduler[uid0](
+                            policy_optimizer, **self._policy_learning_rate_scheduler_kwargs[uid0]
+                        )
+                    else:
+                        policy_scheduler = None
+                    if self._value_learning_rate_scheduler[uid0] is not None:
+                        value_scheduler = self._value_learning_rate_scheduler[uid0](
+                            value_optimizer, **self._value_learning_rate_scheduler_kwargs[uid0]
+                        )
+                    else:
+                        value_scheduler = None
+                    
                 for uid in self.possible_agents:
-                    self.optimizers[uid] = optimizer
-                    if self._learning_rate_scheduler[uid] is not None:
-                        if scheduler is None:
-                            self.schedulers[uid] = self._learning_rate_scheduler[uid](
-                                optimizer, **self._learning_rate_scheduler_kwargs[uid]
-                            )
+                    if policy is not None and value is not None:
+                        if policy is value:
+                            self.optimizers[uid] = optimizer
+                            if self._learning_rate_scheduler[uid] is not None:
+                                if scheduler is None:
+                                    self.schedulers[uid] = self._learning_rate_scheduler[uid](
+                                        optimizer, **self._learning_rate_scheduler_kwargs[uid]
+                                    )
+                                else:
+                                    self.schedulers[uid] = scheduler
+                            self.checkpoint_modules[uid]["optimizer"] = optimizer
                         else:
-                            self.schedulers[uid] = scheduler
-                    self.checkpoint_modules[uid]["optimizer"] = optimizer
-
+                            self.policy_optimizers[uid] = policy_optimizer
+                            self.value_optimizers[uid] = value_optimizer
+                            if self._policy_learning_rate_scheduler[uid] is not None:
+                                if policy_scheduler is None:
+                                    self.policy_schedulers[uid] = self._policy_learning_rate_scheduler[uid](
+                                        policy_optimizer, **self._policy_learning_rate_scheduler_kwargs[uid]
+                                    )
+                                else:
+                                    self.policy_schedulers[uid] = policy_scheduler
+                            if self._value_learning_rate_scheduler[uid] is not None:
+                                if value_scheduler is None:
+                                    self.value_schedulers[uid] = self._value_learning_rate_scheduler[uid](
+                                        value_optimizer, **self._value_learning_rate_scheduler_kwargs[uid]
+                                    )
+                                else:
+                                    self.value_schedulers[uid] = value_scheduler
+                            self.checkpoint_modules[uid]["policy_optimizer"] = policy_optimizer
+                            self.checkpoint_modules[uid]["value_optimizer"] = value_optimizer
                     # set up preprocessors
                     if self._state_preprocessor[uid] is not None:
                         self._state_preprocessor[uid] = self._state_preprocessor[uid](
@@ -238,6 +352,18 @@ class IPPO(MultiAgent):
                         self.checkpoint_modules[uid]["value_preprocessor"] = self._value_preprocessor[uid]
                     else:
                         self._value_preprocessor[uid] = self._empty_preprocessor
+
+                    total_actions = sum(self.action_spaces[a].shape[0] for a in self.possible_agents)
+                    # print(total_actions)
+                    # 10
+                    if self._all_action_preprocessor[uid] is not None:
+                        self._all_action_preprocessor[uid] = self._all_action_preprocessor[uid](
+                            **self._all_action_preprocessor_kwargs[uid], 
+                            size=total_actions
+                        )
+                        self.checkpoint_modules[uid]["all_action_preprocessor"] = self._all_action_preprocessor[uid]
+                    else:
+                        self._all_action_preprocessor[uid] = self._empty_preprocessor
         else:
             # check if all policies are the same
             for uid in self.possible_agents:
@@ -274,6 +400,14 @@ class IPPO(MultiAgent):
                     self.checkpoint_modules[uid]["value_preprocessor"] = self._value_preprocessor[uid]
                 else:
                     self._value_preprocessor[uid] = self._empty_preprocessor
+
+                if self._all_action_preprocessor[uid] is not None:
+                    self._all_action_preprocessor[uid] = self._all_action_preprocessor[uid](
+                        **self._all_action_preprocessor_kwargs[uid]
+                    )
+                    self.checkpoint_modules[uid]["all_action_preprocessor"] = self._all_action_preprocessor[uid]
+                else:
+                    self._all_action_preprocessor[uid] = self._empty_preprocessor
 
         self._debug = self.cfg.get("debug", {})
         self._writer = None
@@ -330,8 +464,10 @@ class IPPO(MultiAgent):
                 self.memories[uid].create_tensor(name="returns", size=1, dtype=torch.float32)
                 self.memories[uid].create_tensor(name="advantages", size=1, dtype=torch.float32)
 
+                all_actions_size = sum(self.action_spaces[agent].shape[0] if hasattr(self.action_spaces[agent], 'shape') else self.action_spaces[agent] for agent in self.possible_agents)
+                self.memories[uid].create_tensor(name="all_actions", size=all_actions_size, dtype=torch.float32)
                 # tensors sampled during training
-                self._tensors_names = ["states", "actions", "log_prob", "values", "returns", "advantages"]
+                self._tensors_names = ["states", "actions", "log_prob", "values", "returns", "advantages", "all_actions"]
 
         # create temporary variables needed for storage and computation
         self._current_log_prob = []
@@ -410,21 +546,43 @@ class IPPO(MultiAgent):
         if self.memories:
             self._current_next_states = next_states
 
+            all_actions_concatenated = torch.cat([actions[agent_id] for agent_id in self.possible_agents], dim=-1)
+
             for uid in self.possible_agents:
                 # reward shaping
                 if self._rewards_shaper is not None:
                     rewards[uid] = self._rewards_shaper(rewards[uid], timestep, timesteps)
 
                 # compute values
-                with torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
-                    values, _, _ = self.values[uid].act(
-                        {"states": self._state_preprocessor[uid](states[uid])}, role="value"
-                    )
-                    values = self._value_preprocessor[uid](values, inverse=True)
+                proc_states = self._state_preprocessor[uid](states[uid].float())
+                proc_all_actions = self._all_action_preprocessor[uid](all_actions_concatenated.float())
+
+                # 类型对齐
+                proc_states = proc_states.float()
+                proc_all_actions = proc_all_actions.to(proc_states.dtype)
+
+                # 拼成 centralized critic 的输入 [B, S + A_tot]
+                value_inputs = torch.cat([proc_states,  proc_all_actions], dim=-1)
+
+                # print("value_inputs.shape")
+                # print(value_inputs.shape)
+                # print(proc_states.shape)
+                # print(proc_all_actions.shape)
+
+                # 在采样阶段只需要数值，不需要梯度图，节省内存
+                with torch.no_grad(), torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
+                    values, _, _ = self.values[uid].act({"states": value_inputs}, role="value")
+
+                # 反预处理回到标量价值
+                values = self._value_preprocessor[uid](values, inverse=True)
 
                 # time-limit (truncation) bootstrapping
                 if self._time_limit_bootstrap[uid]:
                     rewards[uid] += self._discount_factor[uid] * values * truncated[uid]
+
+                # print("values.shape")
+                # print(values.shape)
+                # print(proc_all_actions.shape)
 
                 # storage transition in memory
                 self.memories[uid].add_samples(
@@ -436,6 +594,7 @@ class IPPO(MultiAgent):
                     truncated=truncated[uid],
                     log_prob=self._current_log_prob[uid],
                     values=values,
+                    all_actions=all_actions_concatenated,
                 )
 
     def pre_interaction(self, timestep: int, timesteps: int) -> None:
@@ -504,15 +663,20 @@ class IPPO(MultiAgent):
             advantages = torch.zeros_like(rewards)
             not_dones = dones.logical_not()
             memory_size = rewards.shape[0]
+            # print("values.shape")
+            # print(values.shape)
 
             # advantages computation
             for i in reversed(range(memory_size)):
-                next_values = values[i + 1] if i < memory_size - 1 else last_values
+                # next_values = values[i + 1] if i < memory_size - 1 else next_values
+                next_values = values[i + 1] if i < memory_size - 1 else values[-1]
                 advantage = (
                     rewards[i]
                     - values[i]
                     + discount_factor * not_dones[i] * (next_values + lambda_coefficient * advantage)
                 )
+                # print("advantage.shape")
+                # print(advantage.shape)
                 advantages[i] = advantage
             # returns computation
             returns = advantages + values
@@ -520,26 +684,41 @@ class IPPO(MultiAgent):
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
             return returns, advantages
-
         if self._shared_parameters:
             # if parameters are shared, the agents share the same policy, value, optimizer and scheduler.
             # use the first agent's uid to access
             uid0 = self.possible_agents[0]
             policy = self.policies[uid0]
             value = self.values[uid0]
-            optimizer = self.optimizers[uid0]
-            scheduler = self.schedulers.get(uid0, None)
+            if self._separate:
+                policy_optimizer = self.policy_optimizers[uid0]
+                value_optimizer = self.value_optimizers[uid0]
+                policy_scheduler = self.policy_schedulers.get(uid0, None)
+                value_scheduler = self.value_schedulers.get(uid0, None)
+            else:
+                optimizer = self.optimizers[uid0]
+                scheduler = self.schedulers.get(uid0, None)
 
             # sample all batches from memories
-            all_sampled_batches = {}
+            all_sampled_batches = {} 
             # compute returns and advantages
             with torch.no_grad(), torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
                 value.train(False)
+                # 通过调用每一个current_next_states输入到policy网络，得到每一个agent的all_actions
+                action_list = []
+                for agent_id in self.possible_agents:
+                    last_policy_data = self.policies[agent_id].act({"states": self._state_preprocessor[agent_id](self._current_next_states[agent_id].float())}, role="policy")
+                    action_list.append(last_policy_data[0])
+                # debug 状态输入有问题
+                last_all_actions_concatenated = torch.cat(action_list, dim=-1)
+                last_values_inputs = torch.cat([self._state_preprocessor[uid0](self._current_next_states[uid0].float()), last_all_actions_concatenated], dim=-1)
                 last_values, _, _ = value.act(
-                    {"states": self._state_preprocessor[uid0](self._current_next_states[uid0].float())}, role="value"
+                    {"states": last_values_inputs}, role="value"
                 )
                 value.train(True)
             last_values = self._value_preprocessor[uid0](last_values, inverse=True)
+            print("last_values.shape")
+            print(last_values.shape)
 
             for uid in self.possible_agents:
                 memory = self.memories[uid]
@@ -589,6 +768,7 @@ class IPPO(MultiAgent):
                             sampled_values,
                             sampled_returns,
                             sampled_advantages,
+                            sampled_all_actions,
                         ) = all_sampled_batches[uid][minibatch_idx]
 
                         with torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
@@ -625,7 +805,13 @@ class IPPO(MultiAgent):
                             policy_loss[uid] = -torch.min(surrogate, surrogate_clipped).mean()
 
                             # compute value loss
-                            predicted_values[uid], _, _ = value.act({"states": sampled_states}, role="value")
+                            # print("sampled_states.shape")
+                            # print(sampled_states.shape)
+                            # print("sampled_all_actions.shape")
+                            # print(sampled_all_actions.shape)
+                            sampled_all_actions = self._all_action_preprocessor[uid](sampled_all_actions, train=not epoch)
+                            value_inputs = torch.cat([sampled_states, sampled_all_actions], dim=-1)
+                            predicted_values[uid], _, _ = value.act({"states": value_inputs}, role="value")
 
                             if self._clip_predicted_values:
                                 predicted_values[uid] = sampled_values + torch.clip(
@@ -672,8 +858,13 @@ class IPPO(MultiAgent):
                     #         predicted_values[first_uid].retain_grad()
 
                     # optimization step for all agents
-                    optimizer.zero_grad()
-                    self.scaler.scale(all_policy_loss + all_value_loss + all_entropy_loss).backward()
+                    if self._separate:
+                        policy_optimizer.zero_grad()
+                        value_optimizer.zero_grad()
+                        self.scaler.scale(all_policy_loss + all_value_loss + all_entropy_loss).backward()
+                    else:
+                        optimizer.zero_grad()
+                        self.scaler.scale(all_policy_loss + all_value_loss + all_entropy_loss).backward()
 
                     
                     # # 打印value_loss相对于predicted_values的导数
@@ -718,7 +909,11 @@ class IPPO(MultiAgent):
                             value.reduce_parameters()
 
                     if self._grad_norm_clip[uid0] > 0:
-                        self.scaler.unscale_(optimizer)
+                        if self._separate:
+                            self.scaler.unscale_(policy_optimizer)
+                            self.scaler.unscale_(value_optimizer)
+                        else:
+                            self.scaler.unscale_(optimizer)
 
                         
                         # # === 新增：打印参数梯度范数、写入 TensorBoard 直方图 ===
@@ -755,7 +950,11 @@ class IPPO(MultiAgent):
                                 itertools.chain(policy.parameters(), value.parameters()), self._grad_norm_clip[uid0]
                             )
 
-                    self.scaler.step(optimizer)
+                    if self._separate:
+                        self.scaler.step(policy_optimizer)
+                        self.scaler.step(value_optimizer)
+                    else:
+                        self.scaler.step(optimizer)
                     self.scaler.update()
 
                     # update cumulative losses for all agents
@@ -765,16 +964,38 @@ class IPPO(MultiAgent):
                         cumulative_all_entropy_loss += all_entropy_loss.item()
 
                 # update learning rate
-                if scheduler is not None:
-                    if isinstance(scheduler, KLAdaptiveLR):
-                        kl = torch.tensor(kl_divergences, device=self.device).mean()
-                        # reduce (collect from all workers/processes) KL in distributed runs
-                        if config.torch.is_distributed:
-                            torch.distributed.all_reduce(kl, op=torch.distributed.ReduceOp.SUM)
-                            kl /= config.torch.world_size
-                        scheduler.step(kl.item())
-                    else:
-                        scheduler.step()
+                if self._separate:
+                    if policy_scheduler is not None:
+                        if isinstance(policy_scheduler, KLAdaptiveLR):
+                            kl = torch.tensor(kl_divergences, device=self.device).mean()
+                            # reduce (collect from all workers/processes) KL in distributed runs
+                            if config.torch.is_distributed:
+                                torch.distributed.all_reduce(kl, op=torch.distributed.ReduceOp.SUM)
+                                kl /= config.torch.world_size
+                            policy_scheduler.step(kl.item())
+                        else:
+                            policy_scheduler.step()
+                    if value_scheduler is not None:
+                        if isinstance(value_scheduler, KLAdaptiveLR):
+                            kl = torch.tensor(kl_divergences, device=self.device).mean()
+                            # reduce (collect from all workers/processes) KL in distributed runs
+                            if config.torch.is_distributed:
+                                torch.distributed.all_reduce(kl, op=torch.distributed.ReduceOp.SUM)
+                                kl /= config.torch.world_size
+                            value_scheduler.step(kl.item())
+                        else:
+                            value_scheduler.step()
+                else:
+                    if scheduler is not None:
+                        if isinstance(scheduler, KLAdaptiveLR):
+                            kl = torch.tensor(kl_divergences, device=self.device).mean()
+                            # reduce (collect from all workers/processes) KL in distributed runs
+                            if config.torch.is_distributed:
+                                torch.distributed.all_reduce(kl, op=torch.distributed.ReduceOp.SUM)
+                                kl /= config.torch.world_size
+                            scheduler.step(kl.item())
+                        else:
+                            scheduler.step()
 
             # record data in case of shared parameters
             self.track_data(
@@ -793,8 +1014,18 @@ class IPPO(MultiAgent):
             self.track_data(
                 f"Policy / Standard deviation (shared)", policy.distribution(role="policy").stddev.mean().item()
             )
-            if scheduler is not None:
-                self.track_data(f"Learning / Learning rate (shared)", scheduler.get_last_lr()[0])
+            if self._separate:
+                if policy_scheduler is not None:
+                    self.track_data(f"Learning / Learning rate (shared)", policy_scheduler.get_last_lr()[0])
+                if value_scheduler is not None:
+                    self.track_data(f"Learning / Learning rate (shared)", value_scheduler.get_last_lr()[0])
+            else:
+                if scheduler is not None:
+                    self.track_data(f"Learning / Learning rate (shared)", scheduler.get_last_lr()[0])
+
+            # 在训练循环结束后
+            del predicted_values, entropy_loss, policy_loss, value_loss
+            torch.cuda.empty_cache()
 
         else:
             for uid in self.possible_agents:

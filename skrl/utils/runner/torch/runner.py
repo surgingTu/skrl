@@ -1,6 +1,7 @@
 from typing import Any, Mapping, Type, Union
 
 import copy
+import gymnasium as gym
 
 from skrl import logger
 from skrl.agents.torch import Agent
@@ -205,6 +206,7 @@ class Runner:
         state_spaces = env.state_spaces if multi_agent else {"agent": env.state_space}
         observation_spaces = env.observation_spaces if multi_agent else {"agent": env.observation_space}
         action_spaces = env.action_spaces if multi_agent else {"agent": env.action_space}
+        value_extra_observation_spaces = env.action_spaces["drone_0"].shape[0] * len(env.possible_agents)
 
         agent_class = cfg.get("agent", {}).get("class", "").lower()
 
@@ -240,8 +242,18 @@ class Runner:
                                 raise ValueError(f"No 'class' field defined in 'models:{role}' cfg")
                             del models_cfg[role]["class"]
                             model_class = self._component(model_class)
+                            if role == "value":
+                                original_shape = observation_spaces[agent_id].shape
+                                new_shape = (original_shape[0] + value_extra_observation_spaces, )
+                                observation_space = gym.spaces.Box(
+                                    low=observation_spaces[agent_id].low[0],
+                                    high=observation_spaces[agent_id].high[0],
+                                    shape=new_shape,
+                                    dtype=observation_spaces[agent_id].dtype
+                                )
+                            else:
+                                observation_space = observation_spaces[agent_id]
                             # get specific spaces according to agent/model cfg
-                            observation_space = observation_spaces[agent_id]
                             if agent_class == "mappo" and role == "value":
                                 observation_space = state_spaces[agent_id]
                             if agent_class == "amp" and role == "discriminator":
