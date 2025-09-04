@@ -632,7 +632,6 @@ class IPPO(MultiAgent):
         :param timesteps: Number of timesteps
         :type timesteps: int
         """
-
         def compute_gae(
             rewards: torch.Tensor,
             dones: torch.Tensor,
@@ -663,13 +662,11 @@ class IPPO(MultiAgent):
             advantages = torch.zeros_like(rewards)
             not_dones = dones.logical_not()
             memory_size = rewards.shape[0]
-            # print("values.shape")
-            # print(values.shape)
 
             # advantages computation
             for i in reversed(range(memory_size)):
-                # next_values = values[i + 1] if i < memory_size - 1 else next_values
-                next_values = values[i + 1] if i < memory_size - 1 else values[-1]
+                next_values = values[i + 1] if i < memory_size - 1 else next_values
+                # next_values = values[i + 1] if i < memory_size - 1 else values[-1]
                 advantage = (
                     rewards[i]
                     - values[i]
@@ -700,7 +697,7 @@ class IPPO(MultiAgent):
                 scheduler = self.schedulers.get(uid0, None)
 
             # sample all batches from memories
-            all_sampled_batches = {} 
+            all_sampled_batches = {}
             # compute returns and advantages
             with torch.no_grad(), torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
                 value.train(False)
@@ -709,29 +706,51 @@ class IPPO(MultiAgent):
                 for agent_id in self.possible_agents:
                     last_policy_data = self.policies[agent_id].act({"states": self._state_preprocessor[agent_id](self._current_next_states[agent_id].float())}, role="policy")
                     action_list.append(last_policy_data[0])
+                num_envs = self._current_next_states[self.possible_agents[0]].shape[0]
+                obs_dim = self.observation_spaces[self.possible_agents[0]].shape[0]
+                act_dim = self.action_spaces[self.possible_agents[0]].shape[0]
                 # debug 状态输入有问题
                 last_all_actions_concatenated = torch.cat(action_list, dim=-1)
-                last_values_inputs = torch.cat([self._state_preprocessor[uid0](self._current_next_states[uid0].float()), last_all_actions_concatenated], dim=-1)
-                last_values, _, _ = value.act(
-                    {"states": last_values_inputs}, role="value"
-                )
-                value.train(True)
-            last_values = self._value_preprocessor[uid0](last_values, inverse=True)
-            print("last_values.shape")
-            print(last_values.shape)
 
+                processed_states = [
+                    self._state_preprocessor[agent_id](self._current_next_states[agent_id].float())
+                    for agent_id in self.possible_agents
+                ]
+                all_processed_states = torch.cat(processed_states, dim=-1)
+                all_processed_states = all_processed_states.reshape(num_envs, len(self.possible_agents), obs_dim)
+                last_values_input_list = [
+                    torch.cat([all_processed_states[:, i, :], last_all_actions_concatenated], dim=-1)
+                    for i in range(len(self.possible_agents))
+                ]
+                last_values_input_tensor = torch.cat(last_values_input_list, dim=-1)
+                last_values_input_tensor = last_values_input_tensor.reshape(num_envs, len(self.possible_agents), obs_dim+act_dim*len(self.possible_agents))
+                last_values = []
+                for i in range(len(self.possible_agents)):
+                    values, _, _ = value.act({"states": last_values_input_tensor[:, i, :]}, role="value")
+                    last_values.append(values)
+                last_values_tensor = torch.cat(last_values, dim=-1)
+                last_values_tensor = last_values_tensor.reshape(num_envs, len(self.possible_agents), 1)
+                value.train(True)
+            last_values = [
+                self._value_preprocessor[agent_id](last_values_tensor[:, i, :], inverse=True)
+                for i, agent_id in enumerate(self.possible_agents)
+            ]
+            last_values_tensor = torch.cat(last_values, dim=-1)
+            last_values_tensor = last_values_tensor.reshape(num_envs, len(self.possible_agents), 1)
+
+            cnt = 0
             for uid in self.possible_agents:
                 memory = self.memories[uid]
-
                 values = memory.get_tensor_by_name("values")
                 returns, advantages = compute_gae(
                     rewards=memory.get_tensor_by_name("rewards"),
                     dones=memory.get_tensor_by_name("terminated") | memory.get_tensor_by_name("truncated"),
                     values=values,
-                    next_values=last_values,
+                    next_values=last_values_tensor[:, cnt, :],
                     discount_factor=self._discount_factor[uid],
                     lambda_coefficient=self._lambda[uid],
                 )
+                cnt += 1
 
                 memory.set_tensor_by_name("values", self._value_preprocessor[uid](values, train=True))
                 memory.set_tensor_by_name("returns", self._value_preprocessor[uid](returns, train=True))
@@ -1016,9 +1035,9 @@ class IPPO(MultiAgent):
             )
             if self._separate:
                 if policy_scheduler is not None:
-                    self.track_data(f"Learning / Learning rate (shared)", policy_scheduler.get_last_lr()[0])
+                    self.track_data(f"Learning / Policy Learning rate (shared)", policy_scheduler.get_last_lr()[0])
                 if value_scheduler is not None:
-                    self.track_data(f"Learning / Learning rate (shared)", value_scheduler.get_last_lr()[0])
+                    self.track_data(f"Learning / Value Learning rate (shared)", value_scheduler.get_last_lr()[0])
             else:
                 if scheduler is not None:
                     self.track_data(f"Learning / Learning rate (shared)", scheduler.get_last_lr()[0])
