@@ -218,30 +218,30 @@ class MAPPO(MultiAgent):
                             self.schedulers[uid] = scheduler
                     self.checkpoint_modules[uid]["optimizer"] = optimizer
 
-                    # set up preprocessors
-                    if self._state_preprocessor[uid] is not None:
-                        self._state_preprocessor[uid] = self._state_preprocessor[uid](
-                            **self._state_preprocessor_kwargs[uid]
-                        )
-                        self.checkpoint_modules[uid]["state_preprocessor"] = self._state_preprocessor[uid]
-                    else:
-                        self._state_preprocessor[uid] = self._empty_preprocessor
+                # set up preprocessors
+                if self._state_preprocessor[uid0] is not None:
+                    self._state_preprocessor[uid0] = self._state_preprocessor[uid0](
+                        **self._state_preprocessor_kwargs[uid0]
+                    )
+                    self.checkpoint_modules[uid0]["state_preprocessor"] = self._state_preprocessor[uid0]
+                else:
+                    self._state_preprocessor[uid0] = self._empty_preprocessor
 
-                    if self._shared_state_preprocessor[uid] is not None:
-                        self._shared_state_preprocessor[uid] = self._shared_state_preprocessor[uid](
-                            **self._shared_state_preprocessor_kwargs[uid]
-                        )
-                        self.checkpoint_modules[uid]["shared_state_preprocessor"] = self._shared_state_preprocessor[uid]
-                    else:
-                        self._shared_state_preprocessor[uid] = self._empty_preprocessor
+                if self._shared_state_preprocessor[uid0] is not None:
+                    self._shared_state_preprocessor[uid0] = self._shared_state_preprocessor[uid0](
+                        **self._shared_state_preprocessor_kwargs[uid0]
+                    )
+                    self.checkpoint_modules[uid0]["shared_state_preprocessor"] = self._shared_state_preprocessor[uid0]
+                else:
+                    self._shared_state_preprocessor[uid0] = self._empty_preprocessor
 
-                    if self._value_preprocessor[uid] is not None:
-                        self._value_preprocessor[uid] = self._value_preprocessor[uid](
-                            **self._value_preprocessor_kwargs[uid]
-                        )
-                        self.checkpoint_modules[uid]["value_preprocessor"] = self._value_preprocessor[uid]
-                    else:
-                        self._value_preprocessor[uid] = self._empty_preprocessor
+                if self._value_preprocessor[uid0] is not None:
+                    self._value_preprocessor[uid0] = self._value_preprocessor[uid0](
+                        **self._value_preprocessor_kwargs[uid0]
+                    )
+                    self.checkpoint_modules[uid0]["value_preprocessor"] = self._value_preprocessor[uid0]
+                else:
+                    self._value_preprocessor[uid0] = self._empty_preprocessor
         else:
             # check if all policies are the same
             for uid in self.possible_agents:
@@ -340,7 +340,7 @@ class MAPPO(MultiAgent):
         # sample stochastic actions
         with torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
             data = [
-                self.policies[uid].act({"states": self._state_preprocessor[uid](states[uid])}, role="policy")
+                self.policies[uid].act({"states": self._state_preprocessor[self.possible_agents[0]](states[uid])}, role="policy")
                 for uid in self.possible_agents
             ]
 
@@ -391,6 +391,7 @@ class MAPPO(MultiAgent):
 
         if self.memories:
             shared_states = infos["shared_states"]
+
             self._current_shared_next_states = infos["shared_next_states"]
 
             for uid in self.possible_agents:
@@ -401,9 +402,9 @@ class MAPPO(MultiAgent):
                 # compute values
                 with torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
                     values, _, _ = self.values[uid].act(
-                        {"states": self._shared_state_preprocessor[uid](shared_states)}, role="value"
+                        {"states": self._shared_state_preprocessor[self.possible_agents[0]](shared_states)}, role="value"
                     )
-                    values = self._value_preprocessor[uid](values, inverse=True)
+                    values = self._value_preprocessor[self.possible_agents[0]](values, inverse=True)
 
                 # time-limit (truncation) bootstrapping
                 if self._time_limit_bootstrap[uid]:
@@ -524,7 +525,7 @@ class MAPPO(MultiAgent):
                     role="value",
                 )
                 value.train(True)
-            last_values = self._value_preprocessor[uid](last_values, inverse=True)
+            last_values = self._value_preprocessor[uid0](last_values, inverse=True)
 
             for uid in self.possible_agents:
                 memory = self.memories[uid]
@@ -539,8 +540,8 @@ class MAPPO(MultiAgent):
                     lambda_coefficient=self._lambda[uid],
                 )
 
-                memory.set_tensor_by_name("values", self._value_preprocessor[uid](values, train=True))
-                memory.set_tensor_by_name("returns", self._value_preprocessor[uid](returns, train=True))
+                memory.set_tensor_by_name("values", self._value_preprocessor[uid0](values, train=True))
+                memory.set_tensor_by_name("returns", self._value_preprocessor[uid0](returns, train=True))
                 memory.set_tensor_by_name("advantages", advantages)
 
                 all_sampled_batches[uid] = list(
@@ -573,8 +574,8 @@ class MAPPO(MultiAgent):
                         ) = all_sampled_batches[uid][minibatch_idx]
 
                         with torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
-                            sampled_states = self._state_preprocessor[uid](sampled_states, train=not epoch)
-                            sampled_shared_states = self._shared_state_preprocessor[uid](
+                            sampled_states = self._state_preprocessor[uid0](sampled_states, train=not epoch)
+                            sampled_shared_states = self._shared_state_preprocessor[uid0](
                                 sampled_shared_states, train=not epoch
                             )
 
